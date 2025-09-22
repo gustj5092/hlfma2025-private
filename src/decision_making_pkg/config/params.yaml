@@ -1,0 +1,10 @@
+gps_goto_node:
+  ros__parameters:
+    waypoint_csv: "/home/hyeonseo/hlfma2025/src/decision_making_pkg/config/gps_log1.csv"
+    arrive_dist_m: 2.0
+    stop_wp_indices: "[]"
+    pause_wp_indices: "[]"
+    pause_seconds: 4.0
+    reverse_ranges: "57-77" #, 396-407"
+    speed_forward_pwm: 255
+    speed_reverse_pwm: -150
