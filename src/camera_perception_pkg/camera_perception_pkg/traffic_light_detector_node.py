@@ -18,11 +18,9 @@ from sensor_msgs.msg import Image
 from interfaces_pkg.msg import DetectionArray, BoundingBox2D, Detection
 from std_msgs.msg import String
 
-from .lib import camera_perception_func_lib as CPFL
-
 # ---------------Variable Setting---------------
 # Subscribe할 토픽 이름
-SUB_DETECTION_TOPIC_NAME = "detections"
+SUB_DETECTION_TOPIC_NAME = "traffic_light_detections" # Changed topic
 SUB_IMAGE_TOPIC_NAME = "image_raw"
 
 # Publish할 토픽 이름
@@ -58,22 +56,15 @@ class TrafficLightDetector(Node):
         cv_image = self.cv_bridge.imgmsg_to_cv2(image_msg)
         
         traffic_light_detected = False
+        # The new model gives classes of green, yellow, red, left and speed sign
+        traffic_light_classes = ['red', 'yellow', 'green', 'left']
+
         for detection in detection_msg.detections:
-            if detection.class_name == 'traffic_light':
+            if detection.class_name in traffic_light_classes:
 
-                hsv_ranges = {
-                    'red1': (np.array([0, 100, 95]), np.array([10, 255, 255])),
-                    'red2': (np.array([160, 100, 95]), np.array([179, 255, 255])),
-                    'yellow': (np.array([20, 100, 95]), np.array([30, 255, 255])),
-                    'green': (np.array([40, 100, 95]), np.array([90, 255, 255]))
-                }
-
-                # get_traffic_light_color -> Red, Yellow, Green, Unknown
-                traffic_light_color = CPFL.get_traffic_light_color(cv_image, detection.bbox, hsv_ranges) 
-                
                 # Publish traffic light color as string
                 color_msg = String()
-                color_msg.data = traffic_light_color
+                color_msg.data = detection.class_name
                 print(f'traffic light: {color_msg.data}') 
                 self.publisher.publish(color_msg)
                 traffic_light_detected = True

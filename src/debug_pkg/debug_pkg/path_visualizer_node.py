@@ -1,28 +1,27 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSDurabilityPolicy, QoSReliabilityPolicy
-from sensor_msgs.msg import Image
+from rclpy.qos import QoSProfile
+from rclpy.qos import QoSHistoryPolicy
+from rclpy.qos import QoSDurabilityPolicy
+from rclpy.qos import QoSReliabilityPolicy
+# --- ADDED: Import for handling multiple callbacks safely ---
+from rclpy.callback_groups import ReentrantCallbackGroup
+
 from interfaces_pkg.msg import PathPlanningResult
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from std_msgs.msg import Float32
+
 import cv2
 import numpy as np
-from cv_bridge import CvBridge
 
-#---------------Variable Setting---------------
-SUB_ROI_IMAGE_TOPIC = "roi_image"        # ROI 이미지 토픽
-SUB_SPLINE_PATH_TOPIC = "path_planning_result"  # 경로 계획 결과 토픽
-PUB_TOPIC_NAME = "path_visualized_img"      # 시각화된 이미지 퍼블리시 토픽
-
-#----------------------------------------------
-class PathVisualizerNode(Node):
+class PathVisualizer(Node):
     def __init__(self):
         super().__init__('path_visualizer_node')
 
-        # 파라미터 선언
-        self.sub_roi_image_topic = self.declare_parameter('sub_roi_image_topic', SUB_ROI_IMAGE_TOPIC).value
-        self.sub_spline_path_topic = self.declare_parameter('sub_spline_path_topic', SUB_SPLINE_PATH_TOPIC).value
-        self.pub_topic = self.declare_parameter('pub_topic', PUB_TOPIC_NAME).value
+        # --- Use a ReentrantCallbackGroup for thread-safe callbacks ---
+        self.callback_group = ReentrantCallbackGroup()
 
-        # QoS 설정
         self.qos_profile = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -30,62 +29,61 @@ class PathVisualizerNode(Node):
             depth=1
         )
 
-        # CvBridge 초기화
-        self.cv_bridge = CvBridge()
-
-        # 구독자 설정 (이미지 및 경로 구독)
-        self.roi_image_sub = self.create_subscription(
-            Image, self.sub_roi_image_topic, self.roi_image_callback, self.qos_profile)
+        self.path_sub = self.create_subscription(
+            PathPlanningResult, 
+            'path_planning_result', 
+            self.path_callback, 
+            self.qos_profile,
+            callback_group=self.callback_group)
         
-        self.spline_path_sub = self.create_subscription(
-            PathPlanningResult, self.sub_spline_path_topic, self.spline_path_callback, self.qos_profile)
+        self.steer_sub = self.create_subscription(
+            Float32, 
+            'steering_angle', 
+            self.steer_callback, 
+            self.qos_profile,
+            callback_group=self.callback_group)
 
-        # 퍼블리셔 설정 (시각화된 이미지 퍼블리시)
-        self.publisher = self.create_publisher(Image, self.pub_topic, self.qos_profile)
+        self.publisher = self.create_publisher(Image, 'path_image', self.qos_profile)
+        
+        self.cv_bridge = CvBridge()
+        self.black_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        self.current_steer = 0.0
 
-        # 이미지와 경로 데이터를 저장하기 위한 변수
-        self.roi_image = None
-        self.spline_path = None
+    def steer_callback(self, msg: Float32):
+        """Callback to update the current steering value."""
+        self.current_steer = msg.data
 
-    def roi_image_callback(self, msg: Image):
-        try:
-            self.roi_image = self.cv_bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        except Exception as e:
-            self.get_logger().error(f"Failed to convert ROI image: {str(e)}")
-
-    def spline_path_callback(self, msg: PathPlanningResult):
-        # 경로 데이터를 받아오기
-        self.spline_path = list(zip(msg.x_points, msg.y_points))
-
-        # ROI 이미지와 경로가 모두 준비되었을 때 시각화
-        if self.roi_image is not None and self.spline_path is not None:
-            self.visualize_path()
-
-    def visualize_path(self):
-        # 경로 점들을 이미지 위에 그리기
-        for (x, y) in self.spline_path:
-            # OpenCV에서 좌표는 (x, y) 순서이므로 그대로 사용
-            cv2.circle(self.roi_image, (int(x), int(y)), 5, (0, 0, 255), -1)
-
-        # 시각화된 이미지를 ROS 메시지로 변환하여 퍼블리시
-        try:
-            output_msg = self.cv_bridge.cv2_to_imgmsg(self.roi_image, encoding='bgr8')
-            self.publisher.publish(output_msg)
-        except Exception as e:
-            self.get_logger().error(f"Failed to convert image for publishing: {str(e)}")
-
+    def path_callback(self, path_msg: PathPlanningResult):
+        """Callback to draw the path and steering angle, then publish."""
+        # Create a fresh black image for each frame
+        vis_img = np.zeros((480, 640, 3), dtype=np.uint8)
+        
+        # Draw the path points if any exist
+        for p in path_msg.path_points:
+            cv2.circle(vis_img, (int(p.x), int(p.y)), 3, (0, 0, 255), -1)
+        
+        # Overlay steering value text onto the image
+        steer_text = f"Steer: {self.current_steer:.2f}"
+        cv2.putText(vis_img, steer_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            
+        # Convert to ROS Image message and publish
+        img_msg = self.cv_bridge.cv2_to_imgmsg(vis_img, "bgr8")
+        self.publisher.publish(img_msg)
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PathVisualizerNode()
+    node = PathVisualizer()
     try:
-        rclpy.spin(node)
+        # Use a MultiThreadedExecutor to handle multiple callbacks
+        executor = rclpy.executors.MultiThreadedExecutor()
+        executor.add_node(node)
+        executor.spin()
     except KeyboardInterrupt:
         print("\n\nshutdown\n\n")
     finally:
         node.destroy_node()
+        cv2.destroyAllWindows()
         rclpy.shutdown()
-
 
 if __name__ == '__main__':
     main()

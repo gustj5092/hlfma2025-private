@@ -1,173 +1,168 @@
-// 최대 입력 문자 수
-const unsigned int MAX_INPUT = 15;
+// Henes-style command loop -> MD30C (PWM+DIR) with centered mapping & asym steering
 
-// 핀 번호 변수
-const int STEERING_1 = 2;
-const int STEERING_2 = 3;
-const int FORWARD_RIGHT_1 = 4;
-const int FORWARD_RIGHT_2 = 5;
-const int FORWARD_LEFT_1 = 6;
-const int FORWARD_LEFT_2 =7;
+// ===== Pins (MD30C) =====
+static const int FRONT_PWM = 5;
+static const int FRONT_DIR = 22;
+static const int REAR_PWM  = 6;
+static const int REAR_DIR  = 24;
+static const int STEER_PWM = 9;
+static const int STEER_DIR = 26;
+
+// ===== DIR polarity =====
+static bool FRONT_DIR_FWD = LOW;
+static bool REAR_DIR_FWD  = LOW;
+static bool STEER_DIR_RT  = LOW;
+
+// ===== POT (steering sensor) =====
 const int POT = A2;
-
-// 조향 속도 상수
-const int STEERING_SPEED = 128;
-
-// 가변저항 값 범위
-const int resistance_most_left = 460;
-const int resistance_most_right = 352;
-
-// 조향 최대 단계 수 (한 쪽 기준)
+// 좌/센터/우 실측값 (네 값 반영)
+const int RES_LEFT   = 1000;   // 가장 왼쪽에서 읽힌 값
+const int RES_CENTER = 500;    // 정확한 센터 실측
+const int RES_RIGHT  = 0;     // 가장 오른쪽에서 읽힌 값
 const int MAX_STEERING_STEP = 7;
 
-// 제어 상태 변수
-int angle = 0, resistance = 0, mapped_resistance = 0;
-int left_speed = 0, right_speed = 0;
+// ===== Params =====
+const unsigned int COMMAND_INTERVAL = 50; // ms
+// (기존 파라미터들...)
 
-// 명령 주기 제한 변수
-unsigned long lastCommandTime = 0; // 마지막 명령 처리 시간
-const unsigned int COMMAND_INTERVAL = 50; // 명령 처리 간 최소 대기 시간(ms)
+// === 비례 제어(P-Control)를 위한 새 파라미터 ===
+const float STEER_KP = 30.0; // 비례 상수 (핵심 튜닝값!)
+const int STEER_DEAD_BAND = 0; // 오차가 이 값 이하면 정지 (기존 DEAD_BAND와 역할이 다름)
+const int MIN_STEER_SPEED = 40;  // 모터가 움직이기 시작하는 최소 PWM 값 (옵션)
+// 좌/우 비대칭 토크 보정
+const int STEER_SPEED_R = 150;  // 오른쪽이 덜 가면 좀 더 크게 (0~255)
+const int STEER_SPEED_L = 150;  // 왼쪽
+const int DEAD_BAND      = 1;   // |오차|<=1 → 0 처리
+const int OVERSHOOT_STEP = 1;   // 목표 근처에서 살짝 더 밀어줌(마찰 극복)
 
-// 함수 선언
-void steerRight();
-void steerLeft();
-void maintainSteering();
-void setLeftMotorSpeed(int speed);
-void setRightMotorSpeed(int speed);
-void processIncomingByte(const byte inByte);
-void processData(const char *data);
+// ===== State =====
+int angle_cmd = 0;                 // -MAX..+MAX
+int front_speed = 0, rear_speed = 0;
+unsigned long lastCommandTime = 0;
 
+// ==== MD30C drive ====
+void md30c_drive(int pwmPin, int dirPin, int signedSpeed, bool dirPositiveLevel) {
+  int duty = abs(signedSpeed);
+  if (duty > 255) duty = 255;
+  bool pos = (signedSpeed >= 0);
+  digitalWrite(dirPin, pos ? dirPositiveLevel : !dirPositiveLevel);
+  analogWrite(pwmPin, duty);  // 0 -> brake
+}
+void brake(int pwmPin) { analogWrite(pwmPin, 0); }
+
+void setFrontMotorSpeed(int spd){ md30c_drive(FRONT_PWM, FRONT_DIR, spd, FRONT_DIR_FWD); }
+void setRearMotorSpeed (int spd){ md30c_drive(REAR_PWM,  REAR_DIR,  spd, REAR_DIR_FWD ); }
+void steerRight(){ md30c_drive(STEER_PWM, STEER_DIR, +STEER_SPEED_R, STEER_DIR_RT); }
+void steerLeft (){ md30c_drive(STEER_PWM, STEER_DIR, -STEER_SPEED_L, STEER_DIR_RT); }
+void steerBrake(){ brake(STEER_PWM); }
+
+// ===== Serial parser (s/l/r 그대로) =====
+const unsigned int MAX_INPUT = 20;
+void processData(const char *data) {
+  int sIndex=-1, fIndex=-1, rIndex=-1;
+  for (int i=0; data[i]!='\0'; i++){
+    if (data[i]=='s') sIndex=i;
+    else if (data[i]=='l') fIndex=i;
+    else if (data[i]=='r') rIndex=i;
+  }
+  if (sIndex!=-1 && fIndex!=-1 && rIndex!=-1){
+    int newAngle      = atoi(data + sIndex + 1);
+    int newFrontSpeed = atoi(data + fIndex + 1);
+    int newRearSpeed  = atoi(data + rIndex + 1);
+    angle_cmd   = constrain(newAngle, -MAX_STEERING_STEP, MAX_STEERING_STEP);
+    front_speed = constrain(newFrontSpeed, -255, 255);
+    rear_speed  = constrain(newRearSpeed,  -255, 255);
+  }
+}
+void processIncomingByte(const byte b){
+  static char line[MAX_INPUT]; static unsigned int pos=0;
+  switch(b){
+    case '\n': line[pos]=0; processData(line); pos=0; break;
+    case '\r': break;
+    default: if (pos < (MAX_INPUT-1)) line[pos++]=b; break;
+  }
+}
+
+// ===== Centered piecewise map with clamping =====
+int map_centered(int res_raw) {
+  // 센서 값 클램프 (엔드스톱 밖으로 튀어도 스팬을 유지)
+  int res = res_raw;
+  if (RES_LEFT >= RES_RIGHT) {          // 보통 이렇게 큼->작음
+    if (res > RES_LEFT)  res = RES_LEFT;
+    if (res < RES_RIGHT) res = RES_RIGHT;
+  } else {                              // 혹시 반대 극성 센서면
+    if (res < RES_LEFT)  res = RES_LEFT;
+    if (res > RES_RIGHT) res = RES_RIGHT;
+  }
+
+  long step;
+  if (res >= RES_CENTER) {
+    // 센터(0) → 좌(-MAX)
+    step = map(res, RES_CENTER, RES_LEFT, 0, -MAX_STEERING_STEP);
+  } else {
+    // 센터(0) → 우(+MAX)
+    step = map(res, RES_CENTER, RES_RIGHT, 0, +MAX_STEERING_STEP);
+  }
+  // 데드밴드
+  if (abs(step) <= DEAD_BAND) step = 0;
+  return (int)constrain(step, -MAX_STEERING_STEP, MAX_STEERING_STEP);
+}
+
+// ===== Setup & Loop =====
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
 
-    // 핀 모드 설정
-    pinMode(POT, INPUT);
-    pinMode(STEERING_1, OUTPUT);
-    pinMode(STEERING_2, OUTPUT);
-    pinMode(FORWARD_RIGHT_1, OUTPUT);
-    pinMode(FORWARD_RIGHT_2, OUTPUT);
-    pinMode(FORWARD_LEFT_1, OUTPUT);
-    pinMode(FORWARD_LEFT_2, OUTPUT);
+  pinMode(POT, INPUT);
+  pinMode(FRONT_PWM, OUTPUT); pinMode(FRONT_DIR, OUTPUT);
+  pinMode(REAR_PWM,  OUTPUT); pinMode(REAR_DIR,  OUTPUT);
+  pinMode(STEER_PWM, OUTPUT); pinMode(STEER_DIR, OUTPUT);
+
+  brake(FRONT_PWM); brake(REAR_PWM); brake(STEER_PWM);
+  digitalWrite(FRONT_DIR, LOW); digitalWrite(REAR_DIR, LOW); digitalWrite(STEER_DIR, LOW);
+
+  Serial.println("MD30C + centered steering mapping ready.");
 }
 
 void loop() {
-    // 현재 시간 가져오기
-    unsigned long currentTime = millis();
+  unsigned long now = millis();
+  while (Serial.available() > 0) processIncomingByte(Serial.read());
 
-    // 직렬 데이터 처리
-    while (Serial.available() > 0) {
-        processIncomingByte(Serial.read());
-    }
+  if (now - lastCommandTime >= COMMAND_INTERVAL) {
+    int res = analogRead(POT);
+    int step_now = map_centered(res);
+    int err = angle_cmd - step_now;
 
-    // 일정 시간 간격으로만 제어 명령 실행
-    if (currentTime - lastCommandTime >= COMMAND_INTERVAL) {
-        // 포텐셔미터 값을 읽어 조향 계산
-        resistance = analogRead(POT);
-        mapped_resistance = map(resistance, resistance_most_left, resistance_most_right, -MAX_STEERING_STEP, MAX_STEERING_STEP + 1);
-
-        // 조향 상태에 따라 동작 제어
-        if (mapped_resistance == angle) {
-            maintainSteering();
-        } else if (mapped_resistance > angle) {
-            steerLeft();
-        } else {
-            steerRight();
-        }
-
-        // 모터 속도 설정
-        setLeftMotorSpeed(left_speed);
-        setRightMotorSpeed(right_speed);
-
-        // 마지막 명령 시간 갱신
-        lastCommandTime = currentTime;
-    }
-}
-
-// 조향 제어 함수
-void steerRight() {
-    analogWrite(STEERING_1, STEERING_SPEED);
-    analogWrite(STEERING_2, LOW);
-}
-
-void steerLeft() {
-    analogWrite(STEERING_1, LOW);
-    analogWrite(STEERING_2, STEERING_SPEED);
-}
-
-void maintainSteering() {
-    analogWrite(STEERING_1, LOW);
-    analogWrite(STEERING_2, LOW);
-}
-
-// 모터 속도 설정 함수
-void setLeftMotorSpeed(int speed) {
-    if (speed > 0) {
-        analogWrite(FORWARD_LEFT_1, speed);
-        analogWrite(FORWARD_LEFT_2, LOW);
+    // 비례 제어 로직 시작
+    if (abs(err) <= STEER_DEAD_BAND) {
+      steerBrake(); // 목표 범위 안에 들어오면 정지
     } else {
-        analogWrite(FORWARD_LEFT_1, LOW);
-        analogWrite(FORWARD_LEFT_2, (-1) * speed);
-    }
-}
+      // 오차에 비례하여 조향 속도 계산
+      int steer_speed = (int)(err * STEER_KP);
 
-void setRightMotorSpeed(int speed) {
-    if (speed > 0) {
-        analogWrite(FORWARD_RIGHT_1, speed);
-        analogWrite(FORWARD_RIGHT_2, LOW);
-    } else {
-        analogWrite(FORWARD_RIGHT_1, LOW);
-        analogWrite(FORWARD_RIGHT_2, (-1) * speed);
-    }
-}
+      // 최대/최소 속도 제한
+      steer_speed = constrain(steer_speed, -255, 255);
 
-// 직렬 데이터 처리
-void processIncomingByte(const byte inByte) {
-    static char input_line[MAX_INPUT];
-    static unsigned int input_pos = 0;
-
-    switch (inByte) {
-        case '\n':
-            input_line[input_pos] = 0; // 종료 문자 추가
-            processData(input_line);  // 데이터 처리
-            input_pos = 0; // 버퍼 초기화
-            break;
-
-        case '\r':
-            break; // 캐리지 리턴 무시
-
-        default:
-            if (input_pos < (MAX_INPUT - 1)) {
-                input_line[input_pos++] = inByte;
-            }
-            break;
-    }
-}
-
-// 데이터 패킷 처리
-void processData(const char *data) {
-    int sIndex = -1, lIndex = -1, rIndex = -1;
-
-    // 명령 파싱
-    for (int i = 0; data[i] != '\0'; i++) {
-        if (data[i] == 's') sIndex = i;
-        else if (data[i] == 'l') lIndex = i;
-        else if (data[i] == 'r') rIndex = i;
+      // (옵션) 모터가 약한 힘으로 돌지 못할 때 (Stiction 극복)
+      // 계산된 속도가 0은 아니지만, 최소 구동 속도보다 작을 경우
+      if (steer_speed > 0 && steer_speed < MIN_STEER_SPEED) {
+        steer_speed = MIN_STEER_SPEED;
+      } else if (steer_speed < 0 && steer_speed > -MIN_STEER_SPEED) {
+        steer_speed = -MIN_STEER_SPEED;
+      }
+      
+      // 계산된 속도로 조향 모터 구동
+      md30c_drive(STEER_PWM, STEER_DIR, steer_speed, STEER_DIR_RT);
     }
 
-    if (sIndex != -1 && lIndex != -1 && rIndex != -1) {
-        int newAngle = atoi(data + sIndex + 1);
-        int newLeftSpeed = atoi(data + lIndex + 1);
-        int newRightSpeed = atoi(data + rIndex + 1);
+    setFrontMotorSpeed(front_speed);
+    setRearMotorSpeed(rear_speed);
 
-        // 명령 값 업데이트 (중복 명령 무시)
-        if (newAngle != angle || newLeftSpeed != left_speed || newRightSpeed != right_speed) {
-            angle = newAngle;
-            left_speed = newLeftSpeed;
-            right_speed = newRightSpeed;
+    // (디버그) 필요 시 주석 해제해서 확인
+    // Serial.print("raw="); Serial.print(res);
+    // Serial.print(" step="); Serial.print(step_now);
+    // Serial.print(" cmd="); Serial.print(angle_cmd);
+    // Serial.print(" err="); Serial.println(err);
 
-            // 조향 값 제한
-            if (angle > MAX_STEERING_STEP) angle = MAX_STEERING_STEP;
-            else if (angle < -MAX_STEERING_STEP) angle = -MAX_STEERING_STEP;
-        }
-    }
+    lastCommandTime = now;
+  }
 }

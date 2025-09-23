@@ -11,7 +11,7 @@ from .lib import lidar_perception_func_lib as LPFL
 
 #---------------Variable Setting---------------
 # Subscribe할 토픽 이름
-SUB_TOPIC_NAME = 'lidar_raw'
+SUB_TOPIC_NAME = 'scan'
 
 # Publish할 토픽 이름
 PUB_TOPIC_NAME = 'lidar_processed'
@@ -22,7 +22,7 @@ class LidarSensorDataProcessor(Node):
         super().__init__('lidar_processor_node')
 
         self.qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.VOLATILE,
             depth=1

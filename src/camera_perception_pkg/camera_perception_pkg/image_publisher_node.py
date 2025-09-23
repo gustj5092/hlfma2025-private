@@ -1,6 +1,6 @@
-import rclpy 
-from rclpy.node import Node 
-from sensor_msgs.msg import Image 
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
 from std_msgs.msg import Header
 from cv_bridge import CvBridge, CvBridgeError
 
@@ -13,7 +13,7 @@ import sys
 import cv2
 import os
 
-#---------------Variable Setting---------------
+# ---------------Variable Setting---------------
 # Publish할 토픽 이름
 PUB_TOPIC_NAME = 'image_raw'
 
@@ -21,10 +21,10 @@ PUB_TOPIC_NAME = 'image_raw'
 DATA_SOURCE = 'video'
 
 # 카메라(웹캠) 장치 번호 (ls /dev/video* 명령을 터미널 창에 입력하여 확인)
-CAM_NUM = 0
+CAM_NUM = 2
 
 # 이미지 데이터가 들어있는 디렉토리의 경로를 입력
-IMAGE_DIRECTORY_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/sample_dataset'
+IMAGE_DIRECTORY_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/data1'
 
 # 비디오 데이터 파일의 경로를 입력
 VIDEO_FILE_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/driving_simulation.mp4'
@@ -34,11 +34,11 @@ SHOW_IMAGE = True
 
 # 이미지 발행 주기 (초) - 소수점 필요 (int형은 반영되지 않음)
 TIMER = 0.03
-#----------------------------------------------
+# ----------------------------------------------
 
 class ImagePublisherNode(Node):
-    def __init__(self, data_source=DATA_SOURCE, cam_num=CAM_NUM, img_dir=IMAGE_DIRECTORY_PATH, video_path=VIDEO_FILE_PATH, pub_topic=PUB_TOPIC_NAME, logger=SHOW_IMAGE, timer=TIMER):
-        super().__init__('image_publisher_node')
+    def __init__(self, data_source=DATA_SOURCE, cam_num=CAM_NUM, img_dir=IMAGE_DIRECTORY_PATH, video_path=VIDEO_FILE_PATH, pub_topic=PUB_TOPIC_NAME, logger=SHOW_IMAGE, timer=TIMER, node_name='image_publisher_node'):
+        super().__init__(node_name)
         self.declare_parameter('data_source', data_source)
         self.declare_parameter('cam_num', cam_num)
         self.declare_parameter('img_dir', img_dir)
@@ -102,7 +102,7 @@ class ImagePublisherNode(Node):
                 image_msg.header.frame_id = 'image_frame' 
                 self.publisher.publish(self.br.cv2_to_imgmsg(frame))
                 if self.logger:
-                    cv2.imshow('Camera Image', frame)
+                    cv2.imshow(f'Camera Image {self.cam_num}', frame)
                     cv2.waitKey(1)
         elif self.data_source == 'image':
             while self.img_num < len(self.img_list):
@@ -151,11 +151,12 @@ def main(args=None):
     except KeyboardInterrupt:
         print("\n\nshutdown\n\n")
         pass
-    node.destroy_node()
-    if node.cap.isOpened():
-        node.cap.release()
-    cv2.destroyAllWindows()
-    rclpy.shutdown()
-  
+    finally:
+        if hasattr(node, 'cap') and node.cap.isOpened():
+            node.cap.release()
+        node.destroy_node()
+        cv2.destroyAllWindows()
+        rclpy.shutdown()
+
 if __name__ == '__main__':
     main()

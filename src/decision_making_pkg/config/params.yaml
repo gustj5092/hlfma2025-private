@@ -1,10 +1,18 @@
 gps_goto_node:
   ros__parameters:
-    waypoint_csv: "/home/hyeonseo/hlfma2025/src/decision_making_pkg/config/gps_log1.csv"
+    waypoint_csv: "/home/hyeonseo/hlfma2025/src/decision_making_pkg/config/yonsei1.csv"
     arrive_dist_m: 2.0
     stop_wp_indices: "[]"
     pause_wp_indices: "[]"
     pause_seconds: 4.0
-    reverse_ranges: "57-77" #, 396-407"
-    speed_forward_pwm: 255
-    speed_reverse_pwm: -150
+    reverse_ranges: "212-230" #, 396-407"
+    speed_forward_pwm: 80
+    speed_reverse_pwm: -50
+    sub_lidar_topic: "/scan"
+    lidar_activation_ranges: "118-147" #"13-20" 
+    speed_lidar_zone_pwm: 100
+    
+    # -- 신호등 설정 --
+    sub_traffic_light_topic: "yolov8_traffic_light_info"
+    traffic_light_green_go_ranges: "10-15, 40-45" # Green 신호에 출발하는 구간
+    traffic_light_left_go_ranges: "80-85"       # Left 신호에 출발하는 구간

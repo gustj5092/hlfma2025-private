@@ -1,0 +1,32 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/junseok/hlfma2025/build/serial_communication_pkg",
+        "/home/junseok/hlfma2025/install/serial_communication_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/build/lidar_perception_pkg",
+        "/home/junseok/hlfma2025/install/lidar_perception_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/install/interfaces_pkg/local/lib/python3.10/dist-packages",
+        "/home/junseok/hlfma2025/build/decision_making_pkg",
+        "/home/junseok/hlfma2025/install/decision_making_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/build/debug_pkg",
+        "/home/junseok/hlfma2025/install/debug_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/build/camera_perception_pkg",
+        "/home/junseok/hlfma2025/install/camera_perception_pkg/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/junseok/hlfma2025/build/serial_communication_pkg",
+        "/home/junseok/hlfma2025/install/serial_communication_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/build/lidar_perception_pkg",
+        "/home/junseok/hlfma2025/install/lidar_perception_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/install/interfaces_pkg/local/lib/python3.10/dist-packages",
+        "/home/junseok/hlfma2025/build/decision_making_pkg",
+        "/home/junseok/hlfma2025/install/decision_making_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/build/debug_pkg",
+        "/home/junseok/hlfma2025/install/debug_pkg/lib/python3.10/site-packages",
+        "/home/junseok/hlfma2025/build/camera_perception_pkg",
+        "/home/junseok/hlfma2025/install/camera_perception_pkg/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ]
+}

@@ -22,8 +22,16 @@ setup(
         'console_scripts': [
             'image_publisher_node = camera_perception_pkg.image_publisher_node:main',
             'yolov8_node = camera_perception_pkg.yolov8_node:main',
+            'yolov8_traffic_light_node = camera_perception_pkg.yolov8_traffic_light_node:main',
             'traffic_light_detector_node = camera_perception_pkg.traffic_light_detector_node:main',
             'lane_info_extractor_node = camera_perception_pkg.lane_info_extractor_node:main',
+            'lane_extract = camera_perception_pkg.lane_extract:main',
+            'roi_merger_node = camera_perception_pkg.roi_merger_node:main',
+            'traffic_light_yolov8_node = camera_perception_pkg.traffic_light_yolov8_node:main',
+            'object_detector_node = camera_perception_pkg.object_detector_node:main'
+
         ],
     },
 )
+
+#entry_points에서 정의된 각 노드 맨끝에 :main은 노드의 main함수를 의미함

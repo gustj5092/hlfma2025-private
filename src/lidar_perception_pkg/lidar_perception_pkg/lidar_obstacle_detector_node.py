@@ -2,7 +2,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
-
+import numpy as np
 from rclpy.qos import QoSProfile
 from rclpy.qos import QoSHistoryPolicy
 from rclpy.qos import QoSDurabilityPolicy
@@ -24,56 +24,55 @@ class ObjectDetection(Node):
         super().__init__('lidar_obstacle_detector_node')
 
         self.qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.VOLATILE,
             depth=1
         )
 
-        self.subscriber = self.create_subscription(LaserScan, SUB_TOPIC_NAME, self.lidar_callback, self.qos_profile)
-        self.publisher = self.create_publisher(Bool, PUB_TOPIC_NAME, self.qos_profile) 
+        self.subscriber = self.create_subscription(
+            LaserScan, SUB_TOPIC_NAME, self.lidar_callback, self.qos_profile)
+        self.publisher = self.create_publisher(
+            Bool, PUB_TOPIC_NAME, self.qos_profile) 
 
-        self.detection_checker = LPFL.StabilityDetector(consec_count=5) # 연속적으로 몇 번 감지 여부를 확인할지 설정
-
-
+        self.detection_checker = LPFL.StabilityDetector(consec_count=3)
 
 
     def lidar_callback(self, msg):
-         
-        start_angle = 0  # 원하는 각도 범위의 시작 값
-        end_angle = 30  # 원하는 각도 범위의 끝 값
-        
-        range_min = 0.5  # 원하는 거리 범위의 최소값 [m]
-        range_max = 2.0  # 원하는 거리 범위의 최대값 [m]
+        start_angle_deg = -10  # 차량 정면 좌측 30도
+        end_angle_deg = 10     # 차량 정면 우측 30도
+        range_min_m = 0.5     # 최소 감지 거리 (15cm)
+        range_max_m = 2.0      # 최대 감지 거리 (2m)
 
-        ranges = msg.ranges
+        detected = False
 
+        try:
+            # 2. 각도를 Radian으로 변환
+            start_angle_rad = np.deg2rad(start_angle_deg)
+            end_angle_rad = np.deg2rad(end_angle_deg)
 
-        detected = LPFL.detect_object(ranges=ranges, start_angle=start_angle, end_angle=end_angle, range_min=range_min, range_max=range_max)
-        
-        # ranges는 라이다 센서값 입력                                                        
+            # 3. LaserScan 메시지 정보를 이용해 검사할 인덱스 범위 계산
+            # (시작 각도 - 스캔 최소 각도) / 각도 해상도
+            start_index = int((start_angle_rad - msg.angle_min) / msg.angle_increment)
+            end_index = int((end_angle_rad - msg.angle_min) / msg.angle_increment)
+            
+            # 인덱스가 배열 범위를 벗어나지 않도록 보정
+            start_index = max(0, start_index)
+            end_index = min(len(msg.ranges) - 1, end_index)
 
-        # 각도 범위 지정
-        # 예시 1) 
-        # start_angle을 355도로, end_angle을 4도로 설정하면, 
-        # 355도에서 4도까지의 모든 각도(355, 356, 357, 358, 359, 0, 1, 2, 3, 4도)가 포함.
-        # 
-        # 예시 2)
-        # start_angle을 0도로, end_angle을 30도로 설정하면, 
-        # 0도에서 30도까지의 모든 각도(0, 1, 2, ..., 30도)가 포함.
-        # 
-        # 예시 3)
-        # start_angle을 180도로, end_angle을 190도로 설정하면, 
-        # 180도에서 190도까지의 모든 각도(180, 181, 182, ..., 190도)가 포함. 
+            # 4. 해당 인덱스 범위 내에서 장애물 검사
+            for i in range(start_index, end_index + 1):
+                # inf, nan 같은 유효하지 않은 값은 무시
+                if np.isfinite(msg.ranges[i]) and range_min_m <= msg.ranges[i] <= range_max_m:
+                    detected = True
+                    break  # 장애물 발견 시 즉시 반복 중단
 
-        # 거리범위 지정 
-        # range_min보다 크거나 같고, range_max보다 작거나 같은 거리값을 포함.
+        except Exception as e:
+            self.get_logger().error(f"Error in lidar_callback: {e}")
+            detected = False
 
-        # 각도범위 및 거리범위를 둘 다 만족하는 범위에 라이다 센서값이 존재하면 True, 아니면 False 리턴. 
-
-
+        # 5. 연속 감지 확인 후 결과 발행
         detection_result = self.detection_checker.check_consecutive_detections(detected)
-
         detection_msg = Bool()
         detection_msg.data = detection_result
         self.publisher.publish(detection_msg)

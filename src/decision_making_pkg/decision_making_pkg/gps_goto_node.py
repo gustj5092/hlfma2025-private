@@ -7,8 +7,10 @@ import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSDurabilityPolicy, QoSReliabilityPolicy
-
+from sensor_msgs.msg import LaserScan
+import numpy as np
 from sensor_msgs.msg import NavSatFix
+from std_msgs.msg import String
 from interfaces_pkg.msg import MotionCommand
 
 # u-blox NAV-PVT 메시지 사용
@@ -50,6 +52,8 @@ class GPSGotoNode(Node):
         self.pub_topic     = self.declare_parameter('pub_topic', 'topic_control_signal').value
         self.sub_fix_topic = self.declare_parameter('sub_fix_topic', '/ublox_gps_node/fix').value
         self.sub_navpvt_topic = self.declare_parameter('sub_navpvt_topic', '/ublox_gps_node/navpvt').value
+        self.sub_traffic_light_topic = self.declare_parameter('sub_traffic_light_topic', 'yolov8_traffic_light_info').value
+        self.sub_lidar_topic = self.declare_parameter('sub_lidar_topic', 'scan').value
         self.min_speed_ms     = float(self.declare_parameter('min_speed_ms', 0.5).value)
         self.timer_period   = float(self.declare_parameter('timer', 0.1).value)     # s
         self.arrive_dist_m  = float(self.declare_parameter('arrive_dist_m', 2.0).value)
@@ -65,6 +69,7 @@ class GPSGotoNode(Node):
         self.max_steering  = int(self.declare_parameter('max_steering', 7).value)
         self.speed_forward_pwm = int(self.declare_parameter('speed_forward_pwm', 250).value)  # 0~+255
         self.speed_reverse_pwm = int(self.declare_parameter('speed_reverse_pwm', -200).value) # 0~-255
+        self.speed_lidar_zone_pwm = int(self.declare_parameter('speed_lidar_zone_pwm', self.speed_forward_pwm).value)
 
         # ✨ 기본 주행 속도 (기존 const_pwm 대체; 하위호환 위해 있으면 우선 적용)
         if self.has_parameter('const_pwm'):
@@ -92,13 +97,29 @@ class GPSGotoNode(Node):
         self.reverse_ranges: List[Tup[int, int]] = self._parse_ranges(
             self.declare_parameter('reverse_ranges', '').value
         )
+        self.lidar_activation_ranges: List[Tup[int, int]] = self._parse_ranges(
+            self.declare_parameter('lidar_activation_ranges', '').value
+        )
+        self.traffic_light_green_go_ranges: List[Tup[int, int]] = self._parse_ranges(
+            self.declare_parameter('traffic_light_green_go_ranges', '').value
+        )
+        self.traffic_light_left_go_ranges: List[Tup[int, int]] = self._parse_ranges(
+            self.declare_parameter('traffic_light_left_go_ranges', '').value
+        )
 
         # 상태
         self.paused_until = None
         self.stopped_forever = False
         self.did_autostart = False
+        self.traffic_light_state = "None"
+        self.is_crossing_intersection = False
+        self.latest_scan = None # 최신 라이다 데이터를 저장할 변수
+        self.is_entering_reverse = False
         qos_rel_1 = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.VOLATILE, depth=1)
+        qos_best_effort_1 = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.VOLATILE, depth=1)
         qos_best_10 = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT, history=QoSHistoryPolicy.KEEP_LAST,
@@ -106,7 +127,10 @@ class GPSGotoNode(Node):
 
         self.pub_mc  = self.create_publisher(MotionCommand, self.pub_topic, qos_rel_1)
         self.sub_fix = self.create_subscription(NavSatFix, self.sub_fix_topic, self.on_fix, qos_rel_1)
-
+        self.sub_lidar = self.create_subscription(
+            LaserScan, self.sub_lidar_topic, self.on_lidar, qos_best_effort_1)
+        self.sub_traffic_light = self.create_subscription(
+            String, self.sub_traffic_light_topic, self.on_traffic_light, qos_best_effort_1)
         if _HAS_NAVPVT:
             self.sub_navpvt = self.create_subscription(NavPVT, self.sub_navpvt_topic, self.on_navpvt, qos_best_10)
         else:
@@ -217,7 +241,19 @@ class GPSGotoNode(Node):
 
     def _in_reverse_range(self, idx: int) -> bool:
         return any(a <= idx <= b for (a, b) in self.reverse_ranges)
+    
+    def _in_lidar_activation_range(self, idx: int) -> bool:
+        """현재 웨이포인트 인덱스가 라이다 활성화 구간에 있는지 확인"""
+        return any(start <= idx <= end for (start, end) in self.lidar_activation_ranges)
+    
+    def _in_traffic_light_green_go_range(self, idx: int) -> bool:
+        """현재 웨이포인트가 'Green 신호 출발' 구간에 있는지 확인"""
+        return any(start <= idx <= end for (start, end) in self.traffic_light_green_go_ranges)
 
+    def _in_traffic_light_left_go_range(self, idx: int) -> bool:
+        """현재 웨이포인트가 'Left 신호 출발' 구간에 있는지 확인"""
+        return any(start <= idx <= end for (start, end) in self.traffic_light_left_go_ranges)
+    
     # -------------------- Waypoints & Callbacks --------------------
     def load_waypoints_from_csv(self, path: str):
         waypoints = []
@@ -287,8 +323,93 @@ class GPSGotoNode(Node):
                 yaw_deg += 360.0
             self.curr_yaw = math.radians(yaw_deg)
 
+    def on_lidar(self, msg: LaserScan):
+        """LIDAR 장애물 감지 콜백"""
+        #self.get_logger().info("lidar!")
+        self.latest_scan = msg
+
+    def on_traffic_light(self, msg: String):
+        """신호등 상태를 업데이트하는 콜백"""
+        self.traffic_light_state = msg.data
+
+    def _check_for_obstacle(self) -> bool:
+        """
+        전방(±front_half_angle_deg) 영역에서 유효 리턴의 최소거리가 stop_distance_m 미만이면 True.
+        """
+        if self.latest_scan is None:
+            return False
+
+        msg = self.latest_scan
+        ranges = np.asarray(msg.ranges, dtype=float)
+
+        # 1) 센서 유효범위 기반 필터 (0, NaN, inf, range_min 미만/ range_max 초과 제거)
+        valid = np.isfinite(ranges)
+        valid &= (ranges >= max(1e-3, msg.range_min))
+        valid &= (ranges <= msg.range_max)
+
+        if not np.any(valid):
+            return False  # 유효 리턴이 하나도 없으면 장애물 없음으로 간주
+
+        # 2) 전방 각도 인덱스 산출 (+ 클램프)
+        half = math.radians(getattr(self, "front_half_angle_deg", 45.0))
+        start_idx = int(( -half - msg.angle_min) / msg.angle_increment)
+        end_idx   = int(( +half - msg.angle_min) / msg.angle_increment)
+
+        n = len(ranges)
+        i0 = max(0, min(start_idx, end_idx))
+        i1 = min(n - 1, max(start_idx, end_idx))
+
+        if i1 < i0:  # 방어적 (이론상 위 클램프로 안 생김)
+            return False
+
+        # 3) 전방 영역의 유효 리턴만 추출
+        front = ranges[i0:i1+1]
+        front_valid = valid[i0:i1+1]
+        front_vals = front[front_valid]
+        if front_vals.size == 0:
+            return False
+
+        # 4) 최소거리 판정
+        min_d = float(front_vals.min())
+        threshold = getattr(self, "stop_distance_m", 2.0)
+        if min_d < threshold:
+            self.get_logger().warn(f"Obstacle DETECTED at {min_d:.2f} m < {threshold:.2f} m! Stopping.")
+            return True
+        return False
+
+
     # -------------------- Control Loop --------------------
     def control_loop(self):
+        if self._in_lidar_activation_range(self.current_wp_idx):
+            if self._check_for_obstacle():
+                self.stop_robot()
+                return
+            
+        is_in_tl_zone = self._in_traffic_light_green_go_range(self.current_wp_idx) or \
+                        self._in_traffic_light_left_go_range(self.current_wp_idx)
+
+        if self.is_crossing_intersection and not is_in_tl_zone:
+            self.get_logger().info("Intersection cleared. Resetting crossing state.")
+            self.is_crossing_intersection = False
+        
+        if not self.is_crossing_intersection and is_in_tl_zone:
+            if self._in_traffic_light_green_go_range(self.current_wp_idx):
+                if self.traffic_light_state != "Green":
+                    self.get_logger().warn(f"TL (Green-Go): Waiting for Green. Current: {self.traffic_light_state}. Stopping.")
+                    self.stop_robot()
+                    return
+                else:
+                    self.get_logger().info("TL (Green-Go): Green Signal DETECTED. Start crossing.")
+                    self.is_crossing_intersection = True
+            elif self._in_traffic_light_left_go_range(self.current_wp_idx):
+                if self.traffic_light_state != "Left":
+                    self.get_logger().warn(f"TL (Left-Go): Waiting for Left. Current: {self.traffic_light_state}. Stopping.")
+                    self.stop_robot()
+                    return
+                else:
+                    self.get_logger().info("TL (Left-Go): Left Signal DETECTED. Start crossing.")
+                    self.is_crossing_intersection = True
+
         # 정지 상태 처리
         if self.stopped_forever:
             self.stop_robot()
@@ -360,6 +481,19 @@ class GPSGotoNode(Node):
         desired_yaw = math.atan2(dy, dx)
 
         reverse_mode = self._in_reverse_range(self.current_wp_idx)
+
+        # 후진 구간으로 처음 진입하는 경우, 1초간 정지
+        if reverse_mode and not self.is_entering_reverse:
+            self.get_logger().info("Entering reverse zone. Pausing for 1 second.")
+            self.paused_until = self.get_clock().now() + Duration(seconds=1.0)
+            self.is_entering_reverse = True
+            self.stop_robot()
+            return
+        
+        # 후진 구간이 끝나면 플래그 리셋
+        if not reverse_mode:
+            self.is_entering_reverse = False
+
         if reverse_mode:
             desired_yaw = wrap_pi(desired_yaw + math.pi)  # ✨ 후진 조향
         # 조향 계산
@@ -379,14 +513,20 @@ class GPSGotoNode(Node):
                 f"Error={math.degrees(err):.1f} -> Steering={steering}"
             )
 
+        final_steering = steering
+        is_in_lidar_zone = self._in_lidar_activation_range(self.current_wp_idx)
         # 속도 선택
         if reverse_mode:
             pwm = self.speed_reverse_pwm
+        elif is_in_lidar_zone:
+            # 라이다 구간이고 전진 중이면, 지정된 가속 PWM 값을 사용
+            self.get_logger().info(f"In LIDAR zone, accelerating to PWM: {self.speed_lidar_zone_pwm}")
+            pwm = self.speed_lidar_zone_pwm
         else:
+            # 일반 전진 주행
             pwm = self.speed_forward_pwm
-
         pwm = max(-self.max_abs_pwm, min(self.max_abs_pwm, pwm))
-        self.publish_motion_command(steering, pwm, pwm)
+        self.publish_motion_command(final_steering, pwm, pwm)
 
     def _update_goal_xy_local(self):
         """현재 current_wp_idx 기준 goal_xy_local 갱신"""

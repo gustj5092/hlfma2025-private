@@ -1,3 +1,13 @@
 /install
 /build
 /log
+
+# 하위 워크스페이스(RTK_GPS_NTRIP, data_collection 등)의 colcon 산출물
+src/**/build/
+src/**/install/
+src/**/log/
+
+__pycache__/
+
+# VS Code C++ 인덱스 캐시 (1GB 이상)
+.vscode/browse.vc.db*

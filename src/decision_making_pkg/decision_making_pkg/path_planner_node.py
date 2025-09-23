@@ -9,7 +9,7 @@ from scipy.interpolate import CubicSpline
 #---------------Variable Setting---------------
 SUB_LANE_TOPIC_NAME = "yolov8_lane_info"  # lane_info_extractor 노드에서 퍼블리시하는 타겟 지점 토픽
 PUB_TOPIC_NAME = "path_planning_result"   # 경로 계획 결과 퍼블리시 토픽
-CAR_CENTER_POINT = (320, 179) # 이미지 상에서 차량 앞 범퍼의 중심이 위치한 픽셀 좌표
+CAR_CENTER_POINT = (285, 437) # 이미지 상에서 차량 앞 범퍼의 중심이 위치한 픽셀 좌표
 
 #----------------------------------------------
 class PathPlannerNode(Node):
