@@ -24,6 +24,7 @@ const int MAX_STEERING_STEP = 7;
 // ===== Params =====
 const unsigned int COMMAND_INTERVAL = 50; // ms
 const int MAX_SPEED_CHANGE_PER_INTERVAL = 20;
+const unsigned long RX_TIMEOUT = 300;     // ms, 이 시간 동안 명령이 없으면 즉시 정지 (USB 끊김 대비)
 // (기존 파라미터들...)
 
 // === 비례 제어(P-Control)를 위한 새 파라미터 ===
@@ -45,6 +46,7 @@ int target_rear_speed = 0;
 int current_front_speed = 0;
 int current_rear_speed = 0;
 unsigned long lastCommandTime = 0;
+unsigned long lastRxTime = 0;      // 마지막으로 정상 명령을 받은 시각
 
 // ==== MD30C drive ====
 void md30c_drive(int pwmPin, int dirPin, int signedSpeed, bool dirPositiveLevel) {
@@ -78,6 +80,7 @@ void processData(const char *data) {
     angle_cmd   = constrain(newAngle, -MAX_STEERING_STEP, MAX_STEERING_STEP);
     target_front_speed = constrain(newFrontSpeed, -255, 255);
     target_rear_speed  = constrain(newRearSpeed,  -255, 255);
+    lastRxTime = millis();
   }
 }
 void processIncomingByte(const byte b){
@@ -134,6 +137,12 @@ void loop() {
   while (Serial.available() > 0) processIncomingByte(Serial.read());
 
   if (now - lastCommandTime >= COMMAND_INTERVAL) {
+    // 명령 끊김: 램프 없이 즉시 정지 (조향은 현재 목표 유지)
+    if (millis() - lastRxTime > RX_TIMEOUT) {
+      target_front_speed = target_rear_speed = 0;
+      current_front_speed = current_rear_speed = 0;
+    }
+
     int res = analogRead(POT);
     int step_now = map_centered(res);
     int err = angle_cmd - step_now;
