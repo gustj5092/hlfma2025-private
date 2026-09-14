@@ -56,6 +56,7 @@ class Yolov8TrafficLightNode(LifecycleNode):
         self.declare_parameter("model", "best_traffic_light.pt") # Changed model
         
         # 추론 하드웨어 선택 (cpu / gpu) 
+        #self.declare_parameter("device", "cpu")
         self.declare_parameter("device", "cuda:0")
         #----------------------------------------------
         

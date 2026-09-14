@@ -32,8 +32,8 @@ setup(
             'cmd_vel_to_motion_command = decision_making_pkg.cmd_vel_to_motion_command:main', # Add this line
             'forward_driver_node = decision_making_pkg.forward_driver_node:main',
             'gps_goto_node = decision_making_pkg.gps_goto_node:main',
-
-
+            'fake_gps_publisher = decision_making_pkg.fake_gps_publisher:main',
+            'yolov8_cone_and_yellow_node = decision_making_pkg.yolov8_cone_and_yellow_node:main',
         ],
     },
 )

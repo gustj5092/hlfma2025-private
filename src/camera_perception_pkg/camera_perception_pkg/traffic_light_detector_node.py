@@ -57,7 +57,7 @@ class TrafficLightDetector(Node):
         
         traffic_light_detected = False
         # The new model gives classes of green, yellow, red, left and speed sign
-        traffic_light_classes = ['red', 'yellow', 'green', 'left']
+        traffic_light_classes = ['Red', 'Yellow', 'Green', 'Left']
 
         for detection in detection_msg.detections:
             if detection.class_name in traffic_light_classes:

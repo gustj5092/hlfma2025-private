@@ -109,7 +109,7 @@ def main():
 
     real_path = os.path.dirname(os.path.realpath(__file__))
     DATA_PATH = os.path.dirname(real_path) + '/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets' 
-    SERIAL_PORT = "/dev/ttyACM1"
+    SERIAL_PORT = "/dev/ttyUSB0"
     MAX_STEERING = 7
     
     # --- Initialize collector and serial port ---

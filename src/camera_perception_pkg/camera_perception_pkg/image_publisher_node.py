@@ -18,16 +18,16 @@ import os
 PUB_TOPIC_NAME = 'image_raw'
 
 # 데이터 입력 소스: 'camera', 'image', 또는 'video' 중 택1하여 입력
-DATA_SOURCE = 'video'
+DATA_SOURCE = 'camera'
 
 # 카메라(웹캠) 장치 번호 (ls /dev/video* 명령을 터미널 창에 입력하여 확인)
-CAM_NUM = 2
+CAM_NUM = 12
 
 # 이미지 데이터가 들어있는 디렉토리의 경로를 입력
 IMAGE_DIRECTORY_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/data1'
 
 # 비디오 데이터 파일의 경로를 입력
-VIDEO_FILE_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/driving_simulation.mp4'
+VIDEO_FILE_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/12312.mp4'
 
 # 화면에 publish하는 이미지를 띄울것인지 여부: True, 또는 False 중 택1하여 입력
 SHOW_IMAGE = True
@@ -96,11 +96,11 @@ class ImagePublisherNode(Node):
             ret, frame = self.cap.read()
             if ret:
                 frame = cv2.resize(frame, (640, 480))
-                image_msg = self.br.cv2_to_imgmsg(frame)
+                image_msg = self.br.cv2_to_imgmsg(frame, encoding="bgr8")
                 image_msg.header = Header()
                 image_msg.header.stamp = self.get_clock().now().to_msg()
                 image_msg.header.frame_id = 'image_frame' 
-                self.publisher.publish(self.br.cv2_to_imgmsg(frame))
+                self.publisher.publish(self.br.cv2_to_imgmsg(frame, encoding="bgr8"))
                 if self.logger:
                     cv2.imshow(f'Camera Image {self.cam_num}', frame)
                     cv2.waitKey(1)
@@ -113,11 +113,11 @@ class ImagePublisherNode(Node):
                     self.get_logger().warn('Skipping non-image file: %s' % img_file)
                 else:
                     img = cv2.resize(img, (640, 480))
-                    image_msg = self.br.cv2_to_imgmsg(img)
+                    image_msg = self.br.cv2_to_imgmsg(img, encoding="bgr8")
                     image_msg.header = Header()
                     image_msg.header.stamp = self.get_clock().now().to_msg()
                     image_msg.header.frame_id = 'image_frame'
-                    self.publisher.publish(self.br.cv2_to_imgmsg(img))
+                    self.publisher.publish(self.br.cv2_to_imgmsg(img, encoding="bgr8"))
                     if self.logger:
                         self.get_logger().info('Published image: %s' % img_file)
                         cv2.imshow('Saved Image', img)
@@ -131,7 +131,7 @@ class ImagePublisherNode(Node):
             ret, img = self.cap.read()
             if ret:
                 img = cv2.resize(img, (640, 480))
-                image_msg = self.br.cv2_to_imgmsg(img)
+                image_msg = self.br.cv2_to_imgmsg(img, encoding="bgr8")
                 image_msg.header = Header()
                 image_msg.header.stamp = self.get_clock().now().to_msg()
                 image_msg.header.frame_id = 'image_frame'

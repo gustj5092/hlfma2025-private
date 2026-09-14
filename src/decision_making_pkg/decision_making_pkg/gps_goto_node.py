@@ -10,7 +10,7 @@ from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSDurabilityPolicy, QoSReli
 from sensor_msgs.msg import LaserScan
 import numpy as np
 from sensor_msgs.msg import NavSatFix
-from std_msgs.msg import String
+from std_msgs.msg import String, Empty
 from interfaces_pkg.msg import MotionCommand
 
 # u-blox NAV-PVT 메시지 사용
@@ -56,13 +56,31 @@ class GPSGotoNode(Node):
         self.sub_lidar_topic = self.declare_parameter('sub_lidar_topic', 'scan').value
         self.min_speed_ms     = float(self.declare_parameter('min_speed_ms', 0.5).value)
         self.timer_period   = float(self.declare_parameter('timer', 0.1).value)     # s
-        self.arrive_dist_m  = float(self.declare_parameter('arrive_dist_m', 2.0).value)
-        self.max_angular    = float(self.declare_parameter('max_angular', 1.0).value)
-        self.k_w            = float(self.declare_parameter('k_w', -1.2).value)      # w 게인 (조향 방향 수정)
+        self.arrive_dist_m  = float(self.declare_parameter('arrive_dist_m', 3.0).value)
+        self.max_angular    = float(self.declare_parameter('max_angular', 0.5).value)
+        self.k_w            = float(self.declare_parameter('k_w', -0.4).value)      # w 게인 (조향 방향 수정)
+        self.ref_from_gps_forward_m = float(self.declare_parameter('ref_from_gps_forward_m', 0.5).value)  # GPS가 중심보다 0.6 m 앞에 있다면 +0.6
+        self.ref_from_gps_left_m    = float(self.declare_parameter('ref_from_gps_left_m',    0.0).value)  # 중심보다 좌로 치우친 경우(+), 보통 0
+        self.k_p = float(self.declare_parameter('k_p', -0.4).value) # P 게인 (기존 k_w)
+        self.k_i = float(self.declare_parameter('k_i', -0.01).value) # I 게인 (튜닝 필요)
+        self.k_d = float(self.declare_parameter('k_d', -0.12).value) # D 게인 (튜닝 필요)
 
+        # I항의 과도한 누적을 방지 (Integral Windup 방지)
+        self.integral_max = float(self.declare_parameter('integral_max', 1.0).value)
+        self.integral_min = float(self.declare_parameter('integral_min', -1.0).value)
+
+        # PID 상태 변수
+        self.integral_error = 0.0
+        self.previous_error = 0.0
         # 목표점 (단일 모드도 유지)
         self.goal_lat = float(self.declare_parameter('goal_lat', 37.56163657).value)
         self.goal_lon = float(self.declare_parameter('goal_lon', 126.93716571).value)
+
+        self.steering_alpha = float(self.declare_parameter('steering_alpha', 0.55).value)    # 0.2~0.5
+        self.steering_step_hyst = int(self.declare_parameter('steering_step_hyst', 2).value) # 최소 스텝 변화
+        self.steering_rate_limit = int(self.declare_parameter('steering_rate_limit', 2).value) # 틱당 최대 변화(스텝)
+        self._prev_steering_f = 0.0
+        self._prev_steering_i = 0
 
         # ✨ 속도/스티어 제한 (음수 허용)
         self.max_abs_pwm   = int(self.declare_parameter('max_abs_pwm', 255).value)
@@ -70,7 +88,16 @@ class GPSGotoNode(Node):
         self.speed_forward_pwm = int(self.declare_parameter('speed_forward_pwm', 250).value)  # 0~+255
         self.speed_reverse_pwm = int(self.declare_parameter('speed_reverse_pwm', -200).value) # 0~-255
         self.speed_lidar_zone_pwm = int(self.declare_parameter('speed_lidar_zone_pwm', self.speed_forward_pwm).value)
-
+        self.speed_prepare_zone_pwm = int(self.declare_parameter('speed_prepare_zone_pwm', self.speed_forward_pwm).value)
+        self.traffic_light_left_confidence_count = int(self.declare_parameter('traffic_light_left_confidence_count', 10).value)
+        self.max_pwm_change = int(self.declare_parameter('max_pwm_change', 15).value) # 타이머 주기(0.1초)당 최대 15씩 변경 (튜닝 필요!)
+        self._current_pwm = 0
+        self.initial_drive_pwm = int(self.declare_parameter('initial_drive_pwm', 100).value)
+        self.initial_drive_duration_sec = float(self.declare_parameter('initial_drive_duration_sec', 0.5).value) # 초 단위
+        
+        # 저속 출발 상태를 관리하는 변수들
+        self._is_in_initial_drive = False
+        self._initial_drive_end_time = None
         # ✨ 기본 주행 속도 (기존 const_pwm 대체; 하위호환 위해 있으면 우선 적용)
         if self.has_parameter('const_pwm'):
             cp = int(self.get_parameter('const_pwm').value)
@@ -83,6 +110,9 @@ class GPSGotoNode(Node):
         self.csv_path = self.declare_parameter('waypoint_csv', 'waypoints.csv').value
         self.waypoints = self.load_waypoints_from_csv(self.csv_path)
         self.current_wp_idx = 0
+        self.original_waypoints = list(self.waypoints)
+        self.original_wp_idx = 0
+        self.mission_reset_sent = {'t_parking': False, 'p_parking': False} 
 
         # ✨ 정지/일시정지/후진 구간 파라미터
         self.stop_wp_indices: List[int] = self._parse_index_list(
@@ -107,14 +137,39 @@ class GPSGotoNode(Node):
             self.declare_parameter('traffic_light_left_go_ranges', '').value
         )
 
+        self.t_parking_prepare_ranges = self._parse_ranges(self.declare_parameter('t_parking_prepare_ranges', '').value)
+        self.parallel_parking_prepare_ranges = self._parse_ranges(self.declare_parameter('parallel_parking_prepare_ranges', '').value)
+
+        # ---------- T자 주차 미션 파라미터 선언 ----------
+        self.t_parking_mission_ranges = self._parse_ranges(self.declare_parameter('t_parking_mission_ranges', '').value)
+        self.t_parking_right_csv = self.declare_parameter('t_parking_right_csv', '').value
+        self.t_parking_left_csv = self.declare_parameter('t_parking_left_csv', '').value
+
+        # ---------- 평행 주차 미션 파라미터 선언 ----------
+        self.parallel_parking_mission_ranges = self._parse_ranges(self.declare_parameter('parallel_parking_mission_ranges', '').value)
+        self.p_parking_left_csv = self.declare_parameter('p_parking_left_csv', '').value
+        self.p_parking_right_csv = self.declare_parameter('p_parking_right_csv', '').value
+
+        # ---------- 객체 탐지 토픽 파라미터 선언 ----------
+        self.sub_object_left_topic = self.declare_parameter('sub_object_left_topic', '/object/left/detection_order').value
+        self.sub_object_right_topic = self.declare_parameter('sub_object_right_topic', '/object/right/detection_order').value
         # 상태
         self.paused_until = None
         self.stopped_forever = False
         self.did_autostart = False
         self.traffic_light_state = "None"
+        self.left_signal_counter = 0
         self.is_crossing_intersection = False
         self.latest_scan = None # 최신 라이다 데이터를 저장할 변수
         self.is_entering_reverse = False
+        self.left_detection_order = []
+        self.right_detection_order = []
+        self.is_in_replay_mode = False
+        self.current_mission_name = "None"
+        self.replay_data = []  # List to store (steering, left_speed, right_speed) tuples
+        self.replay_idx = 0
+        self.replay_timer_period = 0.02 # driving_log.csv 재생 주기 (초)
+
         qos_rel_1 = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE, history=QoSHistoryPolicy.KEEP_LAST,
             durability=QoSDurabilityPolicy.VOLATILE, depth=1)
@@ -126,11 +181,17 @@ class GPSGotoNode(Node):
             durability=QoSDurabilityPolicy.VOLATILE, depth=10)
 
         self.pub_mc  = self.create_publisher(MotionCommand, self.pub_topic, qos_rel_1)
+        self.pub_reset_left = self.create_publisher(Empty, '/object/left/reset', 10)
+        self.pub_reset_right = self.create_publisher(Empty, '/object/right/reset', 10)
         self.sub_fix = self.create_subscription(NavSatFix, self.sub_fix_topic, self.on_fix, qos_rel_1)
         self.sub_lidar = self.create_subscription(
             LaserScan, self.sub_lidar_topic, self.on_lidar, qos_best_effort_1)
         self.sub_traffic_light = self.create_subscription(
             String, self.sub_traffic_light_topic, self.on_traffic_light, qos_best_effort_1)
+        
+        self.sub_left_objects = self.create_subscription(String, self.sub_object_left_topic, self.on_left_detection, 10)
+        self.sub_right_objects = self.create_subscription(String, self.sub_object_right_topic, self.on_right_detection, 10)
+
         if _HAS_NAVPVT:
             self.sub_navpvt = self.create_subscription(NavPVT, self.sub_navpvt_topic, self.on_navpvt, qos_best_10)
         else:
@@ -268,7 +329,94 @@ class GPSGotoNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to load CSV {path}: {e}")
         return waypoints
-    
+    def load_replay_data_from_csv(self, path: str) -> List[dict]:
+        data = []
+        try:
+            with open(path, mode='r') as csv_file:
+                csv_reader = csv.DictReader(csv_file)
+                for row in csv_reader:
+                    data.append({'steering': int(row['steering']), 'left_speed': int(row['left_speed']), 'right_speed': int(row['right_speed'])})
+            self.get_logger().info(f"Loaded {len(data)} commands from replay file: {path}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to load replay CSV {path}: {e}")
+        return data
+
+    def start_replay_mission(self, csv_path: str, mission_name: str):
+        """리플레이 미션을 시작"""
+        self.get_logger().info(f"Starting '{mission_name}' mission using {csv_path}")
+        self.stop_robot() # 안전을 위해 일단 정지
+        
+        self.replay_data = self.load_replay_data_from_csv(csv_path)
+        if not self.replay_data:
+            self.get_logger().error("Replay data is empty. Aborting mission.")
+            return
+
+        self.is_in_replay_mode = True
+        self.current_mission_name = mission_name
+        self.original_wp_idx_before_mission = self.current_wp_idx
+        self.replay_idx = 0
+        
+        # 기존 타이머를 잠시 끄고, 리플레이 전용 고속 타이머를 설정
+        self.timer.cancel()
+        self.replay_timer = self.create_timer(self.replay_timer_period, self.execute_replay_step)
+
+    def execute_replay_step(self):
+        """리플레이 데이터 한 스텝을 실행"""
+        if not self.is_in_replay_mode or self.replay_idx >= len(self.replay_data):
+            self.finish_replay_mission()
+            return
+
+        command = self.replay_data[self.replay_idx]
+        self.publish_motion_command(
+            command['steering'], command['left_speed'], command['right_speed']
+        )
+        self.replay_idx += 1
+        
+        if self.replay_idx >= len(self.replay_data):
+            self.finish_replay_mission()
+
+    def finish_replay_mission(self):
+        """리플레이 미션을 종료하고 원래 주행으로 복귀"""
+        if not self.is_in_replay_mode: return
+        
+        self.get_logger().info(f"Mission '{self.current_mission_name}' complete. Returning to main route.")
+        self.stop_robot()
+        
+        # 리플레이 타이머를 끄고 원래 제어 루프 타이머를 재시작
+        if hasattr(self, 'replay_timer'):
+            self.replay_timer.cancel()
+        self.timer = self.create_timer(self.timer_period, self.control_loop)
+
+        # 상태 변수 초기화
+        self.is_in_replay_mode = False
+        self.replay_data = []
+        self.replay_idx = 0
+
+        # 미션 구간의 마지막 웨이포인트 다음부터 주행을 재개
+        resumed = False
+        if self.current_mission_name == "t_parking":
+            try:
+                # 현재 인덱스가 포함된 T주차 구간을 찾아 그 끝 다음으로 점프
+                mission_range = next(r for r in self.t_parking_mission_ranges if r[0] <= self.original_wp_idx_before_mission <= r[1])
+                self.current_wp_idx = mission_range[1] + 1
+                resumed = True
+            except StopIteration: pass
+        elif self.current_mission_name == "p_parking":
+            try:
+                mission_range = next(r for r in self.parallel_parking_mission_ranges if r[0] <= self.original_wp_idx_before_mission <= r[1])
+                self.current_wp_idx = mission_range[1] + 1
+                resumed = True
+            except StopIteration: pass
+
+        if not resumed:
+            self.get_logger().warn("Could not determine next waypoint after mission. Finding nearest.")
+            self._autostart_select_nearest_wp()
+        
+        self.current_mission_name = "None"
+        self._update_goal_xy_local()
+        # 잠시 멈췄다가 출발
+        self.paused_until = self.get_clock().now() + Duration(seconds=1.5)
+        
     def on_fix(self, msg: NavSatFix):
         if msg.status.status < 0: return
         if not _HAS_PYGEODESY:
@@ -304,6 +452,8 @@ class GPSGotoNode(Node):
             if abs(dx) + abs(dy) > 0.02:
                 self.curr_yaw = math.atan2(dy, dx)
 
+    def _in_range_check(self, idx: int, ranges_list: List[Tup[int, int]]) -> bool:
+        return any(a <= idx <= b for (a, b) in ranges_list)
 
     def on_navpvt(self, m: 'NavPVT'):
         try:
@@ -329,8 +479,30 @@ class GPSGotoNode(Node):
         self.latest_scan = msg
 
     def on_traffic_light(self, msg: String):
-        """신호등 상태를 업데이트하는 콜백"""
-        self.traffic_light_state = msg.data
+        """
+        신호등 상태를 업데이트하는 콜백.
+        'Left' 신호는 일정 횟수 이상 연속으로 들어와야 확정.
+        """
+        received_signal = msg.data
+
+        if received_signal == "Left":
+            self.left_signal_counter += 1
+            # self.get_logger().info(f"Left signal count: {self.left_signal_counter}") # 디버깅용
+        else:
+            # Left가 아닌 다른 신호(Red, Green, None 등)가 들어오면 카운터 리셋
+            self.left_signal_counter = 0
+            # Red나 Green은 즉시 상태 업데이트
+            self.traffic_light_state = received_signal
+
+        # 카운터가 설정된 기준값을 넘었을 때만, 최종 상태를 'Left'로 확정
+        if self.left_signal_counter >= self.traffic_light_left_confidence_count:
+            if self.traffic_light_state != "Left":
+                self.get_logger().info(f"Left Signal CONFIRMED with count {self.left_signal_counter}.")
+            self.traffic_light_state = "Left"
+        # 아직 기준값에 도달하지 못했다면, 이전 상태를 유지 (Red가 잠깐 들어와도 무시)
+        elif received_signal != "Left" and self.traffic_light_state == "Left":
+            self.get_logger().info(f"Left Signal LOST. Resetting state.")
+            self.traffic_light_state = received_signal # Left가 끊겼으므로 새로운 신호로 업데이트
 
     def _check_for_obstacle(self) -> bool:
         """
@@ -351,7 +523,7 @@ class GPSGotoNode(Node):
             return False  # 유효 리턴이 하나도 없으면 장애물 없음으로 간주
 
         # 2) 전방 각도 인덱스 산출 (+ 클램프)
-        half = math.radians(getattr(self, "front_half_angle_deg", 45.0))
+        half = math.radians(getattr(self, "front_half_angle_deg", 30.0))
         start_idx = int(( -half - msg.angle_min) / msg.angle_increment)
         end_idx   = int(( +half - msg.angle_min) / msg.angle_increment)
 
@@ -371,15 +543,76 @@ class GPSGotoNode(Node):
 
         # 4) 최소거리 판정
         min_d = float(front_vals.min())
-        threshold = getattr(self, "stop_distance_m", 2.0)
+        threshold = getattr(self, "stop_distance_m", 2.5)
         if min_d < threshold:
             self.get_logger().warn(f"Obstacle DETECTED at {min_d:.2f} m < {threshold:.2f} m! Stopping.")
             return True
         return False
 
+    # ---------- 미션 콜백 함수 ----------
+    def on_left_detection(self, msg: String):
+        self.left_detection_order = msg.data.split(',') if msg.data else []
 
+    def on_right_detection(self, msg: String):
+        self.right_detection_order = msg.data.split(',') if msg.data else []
+        
     # -------------------- Control Loop --------------------
     def control_loop(self):
+        is_in_t_prepare_zone = self._in_range_check(self.current_wp_idx, self.t_parking_prepare_ranges)
+        is_in_p_prepare_zone = self._in_range_check(self.current_wp_idx, self.parallel_parking_prepare_ranges)
+
+        if is_in_t_prepare_zone and not self.mission_reset_sent['t_parking']:
+            self.get_logger().info("Approaching T-Parking zone. Resetting left camera detection.")
+            self.pub_reset_left.publish(Empty())
+            self.mission_reset_sent['t_parking'] = True
+        
+        # T자 주차 미션/준비 구간을 완전히 벗어나면, 다음 랩을 위해 리셋 플래그 초기화
+        elif not is_in_t_prepare_zone and not self._in_range_check(self.current_wp_idx, self.t_parking_mission_ranges):
+            self.mission_reset_sent['t_parking'] = False
+
+        # 평행 주차 준비 구간에 처음 진입하는 순간, 리셋 신호 전송
+        if is_in_p_prepare_zone and not self.mission_reset_sent['p_parking']:
+            self.get_logger().info("Approaching Parallel Parking zone. Resetting right camera detection.")
+            self.pub_reset_right.publish(Empty())
+            self.mission_reset_sent['p_parking'] = True
+
+        # 평행 주차 미션/준비 구간을 완전히 벗어나면, 다음 랩을 위해 리셋 플래그 초기화
+        elif not is_in_p_prepare_zone and not self._in_range_check(self.current_wp_idx, self.parallel_parking_mission_ranges):
+            self.mission_reset_sent['p_parking'] = False
+
+        if self.is_in_replay_mode:
+            return
+        if self._in_range_check(self.current_wp_idx, self.t_parking_mission_ranges):
+            self.get_logger().info(f"Entering T-Parking Zone. Detections: {self.left_detection_order}")
+            csv_path_to_load = None
+            if 'cone' in self.left_detection_order:
+                self.get_logger().info("Decision: Left blocked (cone first). Selecting RIGHT-TURN replay.")
+                csv_path_to_load = self.t_parking_left_csv
+            else:
+                self.get_logger().info("Decision: Left clear (yellow first). Selecting LEFT-TURN replay.")
+                csv_path_to_load = self.t_parking_right_csv
+
+            if csv_path_to_load:
+                self.start_replay_mission(csv_path_to_load, "t_parking")
+            else:
+                self.get_logger().warn("No valid CSV path for T-Parking, skipping mission.")
+            return
+        
+        if self._in_range_check(self.current_wp_idx, self.parallel_parking_mission_ranges):
+            self.get_logger().info(f"Entering P-Parking Zone. Detections: {self.right_detection_order}")
+            csv_path_to_load = None 
+            if 'cone' in self.right_detection_order:
+                self.get_logger().info("Decision: Right blocked (cone first). Selecting LEFT-TURN replay.")
+                csv_path_to_load = self.p_parking_left_csv
+            else:
+                self.get_logger().warn("No decisive detection on RIGHT. Defaulting to RIGHT-TURN.")
+                csv_path_to_load = self.p_parking_right_csv
+            if csv_path_to_load:
+                self.start_replay_mission(csv_path_to_load, "p_parking")
+            else:
+                 self.get_logger().warn("No valid CSV path for P-Parking, skipping mission.")
+            return
+
         if self._in_lidar_activation_range(self.current_wp_idx):
             if self._check_for_obstacle():
                 self.stop_robot()
@@ -417,8 +650,12 @@ class GPSGotoNode(Node):
 
         if self.paused_until is not None:
             if self.get_clock().now() < self.paused_until:
-                self.stop_robot()
-                return
+                # 멈추는 대신, 뒤로 밀리는 것을 방지할 약한 전진 PWM을 줌
+                # 30~50 사이의 값을 테스트하며 최적값을 찾으세요.
+                hill_hold_pwm = 10 
+                self.get_logger().info(f"Pausing on hill, applying hold power: {hill_hold_pwm}", throttle_duration_sec=1)
+                self.publish_motion_command(0, hill_hold_pwm, hill_hold_pwm)
+                return 
             else:
                 self.paused_until = None  # 일시정지 해제
 
@@ -431,12 +668,31 @@ class GPSGotoNode(Node):
             return
 
         # 현재 WP와 거리
-        cx, cy = self.curr_xy
+        # --- 제어 기준점 보정: GPS 위치를 차량 중심(또는 원하는 기준점)으로 이동 ---
+        cx_raw, cy_raw = self.curr_xy  # GPS 실제 위치
+        cx, cy = cx_raw, cy_raw        # 기본값
+        if self.curr_yaw is not None:
+            ux = math.cos(self.curr_yaw)   # 차량 전방 단위벡터 x성분
+            uy = math.sin(self.curr_yaw)   # 차량 전방 단위벡터 y성분
+            # 차량 좌측 단위벡터 = (-uy, +ux)
+            fwd = self.ref_from_gps_forward_m
+            lft = self.ref_from_gps_left_m
+            # GPS -> 기준점 오프셋의 월드좌표 성분
+            dx = fwd*ux + lft*(-uy)
+            dy = fwd*uy + lft*(+ux)
+            # 기준점 좌표 = GPS 좌표 - 오프셋
+            cx = cx_raw - dx
+            cy = cy_raw - dy
+
         gx, gy = self.goal_xy_local
         dx = gx - cx
         dy = gy - cy
         dist = math.hypot(dx, dy)
 
+        self.get_logger().info(
+            f"[Chk] idx={self.current_wp_idx}, dist={dist:.2f}m, "
+            f"goal=({gx:.1f},{gy:.1f}), pos=({cx:.1f},{cy:.1f})"
+        )
         # 도착 판정
         if dist < self.arrive_dist_m:
             self.get_logger().info(f"Reached WP{self.current_wp_idx}")
@@ -471,20 +727,18 @@ class GPSGotoNode(Node):
                 return
             else:
                 self._update_goal_xy_local()
-                # 다음 스텝 계산을 위해 계속 진행
-                cx, cy = self.curr_xy
-                gx, gy = self.goal_xy_local
-                dx = gx - cx
-                dy = gy - cy
+                return
 
         # 방위각 계산 (후진 모드면 π 더해줌)
         desired_yaw = math.atan2(dy, dx)
 
-        reverse_mode = self._in_reverse_range(self.current_wp_idx)
-
+        #reverse_mode = False
+        reverse_mode = self._in_range_check(self.current_wp_idx, self.reverse_ranges)
         # 후진 구간으로 처음 진입하는 경우, 1초간 정지
         if reverse_mode and not self.is_entering_reverse:
-            self.get_logger().info("Entering reverse zone. Pausing for 1 second.")
+            self.get_logger().info(
+                f"Entering reverse zone at target idx={self.current_wp_idx}. Pausing 1s."
+            )
             self.paused_until = self.get_clock().now() + Duration(seconds=1.0)
             self.is_entering_reverse = True
             self.stop_robot()
@@ -500,11 +754,47 @@ class GPSGotoNode(Node):
         if self.curr_yaw is None:
             steering = 0
         else:
+            #err = wrap_pi(desired_yaw - self.curr_yaw)
+            #w   = max(-self.max_angular, min(self.max_angular, self.k_w * err))
+            dt = self.timer_period # 제어 주기 (시간 간격)
             err = wrap_pi(desired_yaw - self.curr_yaw)
-            w   = max(-self.max_angular, min(self.max_angular, self.k_w * err))
-            steering = int(round((w / self.max_angular) * self.max_steering))
-            steering = max(-self.max_steering, min(self.max_steering, steering))
 
+            # P (Proportional) 항
+            p_term = self.k_p * err
+
+            # I (Integral) 항
+            self.integral_error += err * dt
+            # Integral Windup 방지: I항 누적값 제한
+            self.integral_error = max(self.integral_min, min(self.integral_max, self.integral_error))
+            i_term = self.k_i * self.integral_error
+
+            # D (Derivative) 항
+            derivative_error = (err - self.previous_error) / dt
+            d_term = self.k_d * derivative_error
+
+            # 다음 계산을 위해 현재 오차를 이전 오차로 저장
+            self.previous_error = err
+
+            # PID 출력 결합
+            w = p_term + i_term + d_term
+            w = max(-self.max_angular, min(self.max_angular, w))
+            steering_f = (w / self.max_angular) * self.max_steering
+            steering_f = max(-self.max_steering, min(self.max_steering, steering_f))
+            alpha = self.steering_alpha
+            steering_lp = (1.0 - alpha) * self._prev_steering_f + alpha * steering_f
+            self._prev_steering_f = steering_lp
+            steering_i = int(round(steering_lp))
+            steering_i = max(-self.max_steering, min(self.max_steering, steering_i))
+            if abs(steering_i - self._prev_steering_i) < self.steering_step_hyst:
+                steering_i = self._prev_steering_i
+            delta = steering_i - self._prev_steering_i
+            if delta > self.steering_rate_limit:
+                steering_i = self._prev_steering_i + self.steering_rate_limit
+            elif delta < -self.steering_rate_limit:
+                steering_i = self._prev_steering_i - self.steering_rate_limit
+
+            self._prev_steering_i = steering_i
+            steering = steering_i
             # 디버깅 로그
             self.get_logger().info(
                 f"[Controller idx={self.current_wp_idx} {'REV' if reverse_mode else 'FWD'}] "
@@ -514,19 +804,49 @@ class GPSGotoNode(Node):
             )
 
         final_steering = steering
-        is_in_lidar_zone = self._in_lidar_activation_range(self.current_wp_idx)
-        # 속도 선택
-        if reverse_mode:
-            pwm = self.speed_reverse_pwm
-        elif is_in_lidar_zone:
-            # 라이다 구간이고 전진 중이면, 지정된 가속 PWM 값을 사용
-            self.get_logger().info(f"In LIDAR zone, accelerating to PWM: {self.speed_lidar_zone_pwm}")
-            pwm = self.speed_lidar_zone_pwm
-        else:
-            # 일반 전진 주행
-            pwm = self.speed_forward_pwm
-        pwm = max(-self.max_abs_pwm, min(self.max_abs_pwm, pwm))
-        self.publish_motion_command(final_steering, pwm, pwm)
+        if self._is_in_initial_drive:
+            # 저속 출발이 처음 시작되는 순간이라면, 종료 시간 설정
+            if self._initial_drive_end_time is None:
+                duration = Duration(seconds=self.initial_drive_duration_sec)
+                self._initial_drive_end_time = self.get_clock().now() + duration
+                self.get_logger().info(f"Starting initial drive at {self.initial_drive_pwm} PWM for {self.initial_drive_duration_sec} seconds.")
+
+            # 아직 저속 주행 시간이 끝나지 않았다면
+            if self.get_clock().now() < self._initial_drive_end_time:
+                target_pwm = self.initial_drive_pwm
+            # 저속 주행 시간이 끝났다면
+            else:
+                self.get_logger().info("Initial drive complete. Switching to target speed.")
+                self._is_in_initial_drive = False # 저속 출발 모드 해제
+                target_pwm = 0 # 한 틱은 0으로 보내서 충격을 줄이거나, 바로 아래 로직으로 넘어가도 됨
+        
+        # 2. 저속 출발 모드가 아니라면, 원래 로직대로 목표 속도 계산
+        if not self._is_in_initial_drive:
+            is_in_t_prepare = self._in_range_check(self.current_wp_idx, self.t_parking_prepare_ranges)
+            is_in_p_prepare = self._in_range_check(self.current_wp_idx, self.parallel_parking_prepare_ranges)
+            is_in_lidar_zone = self._in_lidar_activation_range(self.current_wp_idx)
+
+            # 속도 선택
+            if reverse_mode:
+                pwm = self.speed_reverse_pwm
+            # 1순위: 주차 준비 구역에 있다면 지정된 감속 속도 사용
+            elif is_in_t_prepare or is_in_p_prepare:
+                self.get_logger().info(f"In Prepare Zone, setting speed to {self.speed_prepare_zone_pwm}", throttle_duration_sec=2)
+                pwm = self.speed_prepare_zone_pwm
+            # 2순위: 라이다 활성화 구간이라면 지정된 속도 사용
+            elif is_in_lidar_zone:
+                self.get_logger().info(f"In LIDAR zone, setting speed to {self.speed_lidar_zone_pwm}", throttle_duration_sec=2)
+                pwm = self.speed_lidar_zone_pwm
+            # 3순위: 일반 전진 주행
+            else:
+                pwm = self.speed_forward_pwm
+            target_pwm = pwm
+
+        # 최종 PWM 값 제한 및 전송 (이 부분은 동일)
+        final_pwm = max(-self.max_abs_pwm, min(self.max_abs_pwm, target_pwm))
+
+        # 최종적으로 업데이트된 PWM 값으로 명령 전송
+        self.publish_motion_command(final_steering, int(final_pwm), int(final_pwm))
 
     def _update_goal_xy_local(self):
         """현재 current_wp_idx 기준 goal_xy_local 갱신"""
@@ -548,10 +868,13 @@ class GPSGotoNode(Node):
 
     def stop_robot(self):
         self.publish_motion_command(0, 0, 0)
+        self._is_in_initial_drive = True 
+        self._initial_drive_end_time = None
 
 def main(args=None):
     rclpy.init(args=args)
     node = GPSGotoNode()
+    node.stop_robot()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

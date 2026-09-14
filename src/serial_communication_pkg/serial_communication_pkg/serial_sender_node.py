@@ -14,7 +14,7 @@ from .lib import protocol_convert_func_lib as PCFL  # 시리얼 프로토콜 변
 SUB_TOPIC_NAME = "topic_control_signal"       # 구독할 토픽명(제어 명령 수신)
 
 # 아두이노 장치 이름 (ls /dev/ttyA* 명령을 터미널 창에 입력하여 확인)
-PORT = '/dev/ttyUSB1'                         # 시리얼 포트 경로(아두이노가 잡힌 디바이스)
+PORT = '/dev/ttyUSB0'                         # 시리얼 포트 경로(아두이노가 잡힌 디바이스)
 #----------------------------------------------
 
 ser = serial.Serial(PORT, 115200, timeout=1)  # 시리얼 포트 오픈(115200bps, 읽기 타임아웃 1초)

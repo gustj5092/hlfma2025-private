@@ -13,7 +13,7 @@ exec(code, module.__dict__)
 def main():
     DATA_PATH= os.path.dirname(real_path) + '/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets' 
     CAMERA_NUM = 0
-    SERIAL_PORT = "/dev/ttyACM1"
+    SERIAL_PORT = "/dev/ttyUSB0"
     MAX_STEERING = 7  # 사용자 정의 최대 조향 단계
 
     print(DATA_PATH)

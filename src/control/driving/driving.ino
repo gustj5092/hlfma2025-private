@@ -16,18 +16,19 @@ static bool STEER_DIR_RT  = LOW;
 // ===== POT (steering sensor) =====
 const int POT = A2;
 // 좌/센터/우 실측값 (네 값 반영)
-const int RES_LEFT   = 1000;   // 가장 왼쪽에서 읽힌 값
-const int RES_CENTER = 500;    // 정확한 센터 실측
-const int RES_RIGHT  = 0;     // 가장 오른쪽에서 읽힌 값
+const int RES_LEFT   = 1023;   // 가장 왼쪽에서 읽힌 값
+const int RES_CENTER = 580;    // 정확한 센터 실측
+const int RES_RIGHT  = 8;     // 가장 오른쪽에서 읽힌 값
 const int MAX_STEERING_STEP = 7;
 
 // ===== Params =====
 const unsigned int COMMAND_INTERVAL = 50; // ms
+const int MAX_SPEED_CHANGE_PER_INTERVAL = 20;
 // (기존 파라미터들...)
 
 // === 비례 제어(P-Control)를 위한 새 파라미터 ===
 const float STEER_KP = 30.0; // 비례 상수 (핵심 튜닝값!)
-const int STEER_DEAD_BAND = 0; // 오차가 이 값 이하면 정지 (기존 DEAD_BAND와 역할이 다름)
+const int STEER_DEAD_BAND = 1; // 오차가 이 값 이하면 정지 (기존 DEAD_BAND와 역할이 다름)
 const int MIN_STEER_SPEED = 40;  // 모터가 움직이기 시작하는 최소 PWM 값 (옵션)
 // 좌/우 비대칭 토크 보정
 const int STEER_SPEED_R = 150;  // 오른쪽이 덜 가면 좀 더 크게 (0~255)
@@ -37,7 +38,12 @@ const int OVERSHOOT_STEP = 1;   // 목표 근처에서 살짝 더 밀어줌(마�
 
 // ===== State =====
 int angle_cmd = 0;                 // -MAX..+MAX
-int front_speed = 0, rear_speed = 0;
+int target_front_speed = 0;
+int target_rear_speed = 0;
+
+// "현재" 모터에 실제 인가되는 속도 (서서히 증가/감소시킬 값)
+int current_front_speed = 0;
+int current_rear_speed = 0;
 unsigned long lastCommandTime = 0;
 
 // ==== MD30C drive ====
@@ -70,8 +76,8 @@ void processData(const char *data) {
     int newFrontSpeed = atoi(data + fIndex + 1);
     int newRearSpeed  = atoi(data + rIndex + 1);
     angle_cmd   = constrain(newAngle, -MAX_STEERING_STEP, MAX_STEERING_STEP);
-    front_speed = constrain(newFrontSpeed, -255, 255);
-    rear_speed  = constrain(newRearSpeed,  -255, 255);
+    target_front_speed = constrain(newFrontSpeed, -255, 255);
+    target_rear_speed  = constrain(newRearSpeed,  -255, 255);
   }
 }
 void processIncomingByte(const byte b){
@@ -104,7 +110,7 @@ int map_centered(int res_raw) {
     step = map(res, RES_CENTER, RES_RIGHT, 0, +MAX_STEERING_STEP);
   }
   // 데드밴드
-  if (abs(step) <= DEAD_BAND) step = 0;
+  //if (abs(step) <= DEAD_BAND) step = 0;
   return (int)constrain(step, -MAX_STEERING_STEP, MAX_STEERING_STEP);
 }
 
@@ -153,15 +159,41 @@ void loop() {
       // 계산된 속도로 조향 모터 구동
       md30c_drive(STEER_PWM, STEER_DIR, steer_speed, STEER_DIR_RT);
     }
+    
+    // 1. Front Motor
+    if (current_front_speed < target_front_speed) {
+      current_front_speed += MAX_SPEED_CHANGE_PER_INTERVAL;
+      if (current_front_speed > target_front_speed) {
+        current_front_speed = target_front_speed; // 목표값 초과 방지
+      }
+    } else if (current_front_speed > target_front_speed) {
+      current_front_speed -= MAX_SPEED_CHANGE_PER_INTERVAL;
+      if (current_front_speed < target_front_speed) {
+        current_front_speed = target_front_speed; // 목표값 초과 방지
+      }
+    }
 
-    setFrontMotorSpeed(front_speed);
-    setRearMotorSpeed(rear_speed);
-
+    // 2. Rear Motor
+    if (current_rear_speed < target_rear_speed) {
+      current_rear_speed += MAX_SPEED_CHANGE_PER_INTERVAL;
+      if (current_rear_speed > target_rear_speed) {
+        current_rear_speed = target_rear_speed;
+      }
+    } else if (current_rear_speed > target_rear_speed) {
+      current_rear_speed -= MAX_SPEED_CHANGE_PER_INTERVAL;
+      if (current_rear_speed < target_rear_speed) {
+        current_rear_speed = target_rear_speed;
+      }
+    }
+    
+    // 계산된 "현재" 속도로 모터 구동
+    setFrontMotorSpeed(current_front_speed);
+    setRearMotorSpeed(current_rear_speed);
     // (디버그) 필요 시 주석 해제해서 확인
-    // Serial.print("raw="); Serial.print(res);
-    // Serial.print(" step="); Serial.print(step_now);
-    // Serial.print(" cmd="); Serial.print(angle_cmd);
-    // Serial.print(" err="); Serial.println(err);
+    Serial.print("Target F: "); Serial.print(target_front_speed);
+    Serial.print(" | Current F: "); Serial.print(current_front_speed);
+    Serial.print(" | Target R: "); Serial.print(target_rear_speed);
+    Serial.print(" | Current R: "); Serial.println(current_rear_speed);
 
     lastCommandTime = now;
   }
